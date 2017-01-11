@@ -3,6 +3,7 @@
 local log = require('log')
 local json = require('json')
 local private = require('box.internal')
+local uri_parse = require('uri').parse
 
 -- see default_cfg below
 local default_vinyl_cfg = {
@@ -114,6 +115,20 @@ local modify_cfg = {
     replication_source = normalize_uri,
 }
 
+local function purge_login_from_uri(uri)
+    local uri = uri_parse(uri)
+    local host = uri.host
+    if host = nil then
+       host = 'localhost'
+    end
+    return string.format('%s:%s', host, uri.service)
+end
+
+-- options that require modification for logging
+local log_cfg_option = {
+	replication_source = purge_login_from_uri,
+}
+
 -- dynamically settable options
 local dynamic_cfg = {
     listen                  = private.cfg_set_listen,
@@ -222,6 +237,9 @@ local function reload_cfg(oldcfg, cfg)
             if not pcall(dynamic_cfg[key]) then
                 rawset(oldcfg, key, oldval) -- revert the old value
                 return box.error() -- re-throw
+            end
+	    if log_cfg_option[key] ~= nil then
+                val = log_cfg_option[key](val)
             end
             log.info("set '%s' configuration option to %s", key,
                 json.encode(val))
