@@ -69,6 +69,9 @@ uri_parse(struct uri *uri, const char *str);
 char *
 uri_format(const struct uri *uri);
 
+char *
+uri_unparse(const struct uri *uri);
+
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif /* defined(__cplusplus) */

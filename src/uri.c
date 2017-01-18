@@ -6601,4 +6601,41 @@ uri_format(const struct uri *uri)
 		 (int) uri->service_len, uri->service);
 	return buf;
 }
+
+char *
+uri_unparse(const struct uri *uri)
+{
+	static char buf[1024];
+	int pos = 0;
+	pos += snprintf(buf + pos, sizeof(buf) - pos, "%.*s:",
+			(int)uri->scheme_len, uri->scheme);
+	if (uri->host_len > 0) {
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "//");
+		if (uri->login_len > 0) {
+			pos += snprintf(buf + pos, sizeof(buf) - pos, "%.*s",
+					(int)uri->login_len, uri->login);
+			if (uri->password_len > 0)
+				pos += snprintf(buf + pos, sizeof(buf) - pos, ":%.*s",
+						(int)uri->password_len, uri->password);
+			pos += snprintf(buf + pos, sizeof(buf) - pos, "@");
+		}
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "%.*s",
+				(int)uri->host_len, uri->host);
+		if (uri->service_len > 0)
+			pos += snprintf(buf + pos, sizeof(buf) - pos, ":%.*s",
+					(int)uri->service_len, uri->service);
+	}
+	if (uri->path_len > 0)
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "%.*s",
+				(int)uri->path_len, uri->path);
+	if (uri->query_len > 0)
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "?%.*s",
+				(int)uri->query_len, uri->query);
+	if (uri->fragment_len > 0)
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "#%.*s",
+				(int)uri->fragment_len, uri->fragment);
+	buf[pos] = '\0';
+	return buf;
+}
+
 /* vim: set ft=ragel: */

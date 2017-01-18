@@ -3,7 +3,7 @@
 local log = require('log')
 local json = require('json')
 local private = require('box.internal')
-local uri_parse = require('uri').parse
+local m_uri = require('uri')
 
 -- see default_cfg below
 local default_vinyl_cfg = {
@@ -116,12 +116,12 @@ local modify_cfg = {
 }
 
 local function purge_login_from_uri(uri)
-    local uri = uri_parse(uri)
-    local host = uri.host
-    if host = nil then
-       host = 'localhost'
+    if uri == nil then
+        return uri
     end
-    return string.format('%s:%s', host, uri.service)
+    local uri = m_uri.parse(uri)
+    uri.password = nil
+    return m_uri.unparse(uri)
 end
 
 -- options that require modification for logging

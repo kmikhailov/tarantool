@@ -25,6 +25,9 @@ struct uri {
 
 int
 uri_parse(struct uri *uri, const char *str);
+
+char *
+uri_unparse(struct uri *uri);
 ]]
 
 local builtin = ffi.C;
@@ -55,6 +58,27 @@ local function parse(str)
     return result
 end
 
+local function unparse(uri)
+    uribuf.scheme = uri.scheme
+    uribuf.scheme_len = string.len(uri.scheme or '')
+    uribuf.login = uri.login
+    uribuf.login_len = string.len(uri.login or '')
+    uribuf.password = uri.password
+    uribuf.password_len = string.len(uri.password or '')
+    uribuf.host = uri.host
+    uribuf.host_len = string.len(uri.host or '')
+    uribuf.service = uri.service
+    uribuf.service_len = string.len(uri.service or '')
+    uribuf.path = uri.path
+    uribuf.path_len = string.len(uri.path or '')
+    uribuf.query = uri.query
+    uribuf.query_len = string.len(uri.query or '')
+    uribuf.fragment = uri.fragment
+    uribuf.fragment_len = string.len(uri.fragment or '')
+    return ffi.string(builtin.uri_unparse(uribuf))
+end
+
 return {
-    parse = parse;
+    parse = parse,
+    unparse = unparse,
 };
