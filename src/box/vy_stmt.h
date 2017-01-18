@@ -54,10 +54,12 @@ struct iovec;
 /**
  * There are two groups of statements:
  *
- *  - SELECT and DELETE are "key" statements.
- *  - DELETE, UPSERT and REPLACE are "tuple" statements.
+ *  - SELECT, DELETE and REPLACE in secondary indexes are "key"
+ *    statements.
+ *  - UPSERT and REPLACE in a primary index are "tuple"
+ *    statements.
  *
- * REPLACE/UPSERT statements structure:
+ * Tuple statements structure:
  *                               data_offset
  *                                    ^
  * +----------------------------------+
@@ -73,7 +75,7 @@ struct iovec;
  * indexed then before MessagePack data are stored offsets only for field 3 and
  * field 5.
  *
- * SELECT/DELETE statements structure.
+ * Key statements structure.
  * +--------------+-----------------+
  * | array header | part1 ... partN |  -  MessagePack data
  * +--------------+-----------------+
@@ -84,19 +86,29 @@ struct vy_stmt {
 	struct tuple base;
 	int64_t lsn;
 	uint8_t  type; /* IPROTO_SELECT/REPLACE/UPSERT/DELETE */
-	/**
-	 * Number of UPSERT statements for the same key preceding
-	 * this statement. Used to trigger upsert squashing in the
-	 * background (see vy_range_set_upsert()).
-	 */
-	uint8_t n_upserts;
-	/** Offsets count before MessagePack data. */
+	union {
+		/**
+		 * Number of UPSERT statements for the same key
+		 * preceding this statement. Used to trigger
+		 * upsert squashing in the background
+		 * @sa vy_range_set_upsert().
+		 */
+		uint8_t n_upserts;
+		/**
+		 * True if the statement contains only key fields
+		 * without offsets. That is such statement can
+		 * be used in comparators as key.
+		 */
+		uint8_t key_compatible;
+	};
 	/**
 	 * Offsets array concatenated with MessagePack fields
 	 * array.
 	 * char raw[0];
 	 */
 };
+
+#define VY_KEY_COMPATIBLE UINT8_MAX
 
 /** Get LSN of the vinyl statement. */
 static inline int64_t
@@ -107,7 +119,7 @@ vy_stmt_lsn(const struct tuple *stmt)
 
 /** Set LSN of the vinyl statement. */
 static inline void
-vy_stmt_lsn_set(struct tuple *stmt, int64_t lsn)
+vy_stmt_set_lsn(struct tuple *stmt, int64_t lsn)
 {
 	((struct vy_stmt *) stmt)->lsn = lsn;
 }
@@ -121,7 +133,7 @@ vy_stmt_type(const struct tuple *stmt)
 
 /** Set type of the vinyl statement. */
 static inline void
-vy_stmt_type_set(struct tuple *stmt, uint8_t type)
+vy_stmt_set_type(struct tuple *stmt, uint8_t type)
 {
 	((struct vy_stmt *) stmt)->type = type;
 }
@@ -135,9 +147,33 @@ vy_stmt_n_upserts(const struct tuple *stmt)
 
 /** Set upserts count of the vinyl statement. */
 static inline void
-vy_stmt_n_upserts_set(struct tuple *stmt, uint8_t n)
+vy_stmt_set_n_upserts(struct tuple *stmt, uint8_t n)
 {
 	((struct vy_stmt *) stmt)->n_upserts = n;
+}
+
+/** Return true, if the statement can be treated as key. */
+static inline bool
+vy_stmt_key_compatible(const struct tuple *stmt)
+{
+	return ((const struct vy_stmt *) stmt)->key_compatible ==
+	       VY_KEY_COMPATIBLE;
+}
+
+/** Set that the statement can or can't be treated as key. */
+static inline bool
+vy_stmt_set_key_compatible(struct tuple *stmt, bool f)
+{
+	return ((struct vy_stmt *) stmt)->key_compatible =
+	       f ? VY_KEY_COMPATIBLE : 0;
+}
+
+/** Return MessagePack array with key fields of the statement. */
+static inline const char *
+vy_stmt_cast_to_key(const struct tuple *stmt)
+{
+	assert(vy_stmt_key_compatible(stmt));
+	return tuple_data(stmt);
 }
 
 /** Create a tuple in the vinyl engine format. @sa tuple_new(). */
@@ -193,12 +229,9 @@ static inline int
 vy_key_compare(const struct tuple *a, const struct tuple *b,
 	       const struct key_def *key_def)
 {
-	assert(vy_stmt_type(a) == IPROTO_SELECT ||
-	       vy_stmt_type(a) == IPROTO_DELETE);
-	assert(vy_stmt_type(b) == IPROTO_SELECT ||
-	       vy_stmt_type(b) == IPROTO_DELETE);
-	return vy_key_compare_raw((const char *) a + a->data_offset,
-				  (const char *) b + b->data_offset, key_def);
+	assert(vy_stmt_key_compatible(a) && vy_stmt_key_compatible(b));
+	return vy_key_compare_raw(vy_stmt_cast_to_key(a),
+				  vy_stmt_cast_to_key(b), key_def);
 }
 
 /**
@@ -215,10 +248,7 @@ static inline int
 vy_tuple_compare(const struct tuple *a, const struct tuple *b,
 		 const struct key_def *key_def)
 {
-	assert(vy_stmt_type(a) == IPROTO_REPLACE ||
-	       vy_stmt_type(a) == IPROTO_UPSERT);
-	assert(vy_stmt_type(b) == IPROTO_REPLACE ||
-	       vy_stmt_type(b) == IPROTO_UPSERT);
+	assert(!vy_stmt_key_compatible(a) && !vy_stmt_key_compatible(b));
 	return tuple_compare_default(a, b, key_def);
 }
 
@@ -237,7 +267,8 @@ static inline int
 vy_tuple_compare_with_key(const struct tuple *tuple, const struct tuple *key,
 			  const struct key_def *key_def)
 {
-	const char *key_mp = tuple_data(key);
+	assert(!vy_stmt_key_compatible(tuple) && vy_stmt_key_compatible(key));
+	const char *key_mp = vy_stmt_cast_to_key(key);
 	uint32_t part_count = mp_decode_array(&key_mp);
 	return tuple_compare_with_key_default(tuple, key_mp, part_count,
 					      key_def);
@@ -248,10 +279,8 @@ static inline int
 vy_stmt_compare(const struct tuple *a, const struct tuple *b,
 		const struct key_def *key_def)
 {
-	bool a_is_tuple = vy_stmt_type(a) == IPROTO_REPLACE ||
-			  vy_stmt_type(a) == IPROTO_UPSERT;
-	bool b_is_tuple = vy_stmt_type(b) == IPROTO_REPLACE ||
-			  vy_stmt_type(b) == IPROTO_UPSERT;
+	bool a_is_tuple = !vy_stmt_key_compatible(a);
+	bool b_is_tuple = !vy_stmt_key_compatible(b);
 	if (a_is_tuple && b_is_tuple) {
 		return vy_tuple_compare(a, b, key_def);
 	} else if (a_is_tuple && !b_is_tuple) {
@@ -269,10 +298,8 @@ static inline int
 vy_stmt_compare_with_key(const struct tuple *stmt, const struct tuple *key,
 			 const struct key_def *key_def)
 {
-	assert(vy_stmt_type(key) == IPROTO_SELECT ||
-	       vy_stmt_type(key) == IPROTO_DELETE);
-	if (vy_stmt_type(stmt) == IPROTO_REPLACE ||
-	    vy_stmt_type(stmt) == IPROTO_UPSERT)
+	assert(vy_stmt_key_compatible(key));
+	if (! vy_stmt_key_compatible(stmt))
 		return vy_tuple_compare_with_key(stmt, key, key_def);
 	return vy_key_compare(stmt, key, key_def);
 }
@@ -309,18 +336,23 @@ vy_stmt_new_delete(struct tuple_format *format, const char *key,
 
 /**
  * Create the REPLACE statement from raw MessagePack data.
- * @param tuple_begin MessagePack data that contain an array of fields WITH the
- *                    array header.
- * @param tuple_end End of the array that begins from @param tuple_begin.
- * @param format Format of a tuple for offsets generating.
- * @param part_count Part count from key definition.
- *
+ * @param tuple_begin    MessagePack data that contain an array of
+ *                       fields WITH the array header.
+ * @param tuple_end      End of the array that begins from
+ *                       \a tuple_begin.
+ * @param format         Format of a tuple for offsets generating.
+ * @param part_count     Part count from key definition.
+ * @param key_compatible True if the statement can be cast to key.
+ *                       It is possible for partial tuples from
+ *                       secondary indexes that consists from
+ *                       only key fields.
  * @retval NULL     Memory allocation error.
  * @retval not NULL Success.
  */
 struct tuple *
 vy_stmt_new_replace(const char *tuple_begin, const char *tuple_end,
-		    struct tuple_format *format, uint32_t part_count);
+		    struct tuple_format *format, uint32_t part_count,
+		    bool key_compatible);
 
  /**
  * Create the UPSERT statement from raw MessagePack data.

@@ -3149,19 +3149,23 @@ vy_range_set_upsert(struct vy_range *range, struct tuple *stmt)
 	 */
 	enum {
 		VY_UPSERT_THRESHOLD = 128,
-		VY_UPSERT_INF = 255,
+		/*
+		 * UINT8_MAX is used for vy_stmt.key_compatible
+		 * field.
+		 */
+		VY_UPSERT_INF = UINT8_MAX - 1,
 	};
 	if (older != NULL)
-		vy_stmt_n_upserts_set(stmt, vy_stmt_n_upserts(older));
+		vy_stmt_set_n_upserts(stmt, vy_stmt_n_upserts(older));
 	if (vy_stmt_n_upserts(stmt) != VY_UPSERT_INF) {
-		vy_stmt_n_upserts_set(stmt, vy_stmt_n_upserts(stmt) + 1);
+		vy_stmt_set_n_upserts(stmt, vy_stmt_n_upserts(stmt) + 1);
 		if (vy_stmt_n_upserts(stmt) > VY_UPSERT_THRESHOLD) {
 			vy_index_squash_upserts(index, stmt);
 			/*
 			 * Prevent further upserts from starting new
 			 * workers while this one is in progress.
 			 */
-			vy_stmt_n_upserts_set(stmt, VY_UPSERT_INF);
+			vy_stmt_set_n_upserts(stmt, VY_UPSERT_INF);
 		}
 	}
 
@@ -3205,7 +3209,7 @@ vy_tx_write(struct txv *v, enum vinyl_status status, int64_t lsn)
 	struct tuple *stmt = v->stmt;
 	struct vy_range *range = NULL;
 
-	vy_stmt_lsn_set(stmt, lsn);
+	vy_stmt_set_lsn(stmt, lsn);
 
 	/*
 	 * If we're recovering the WAL, it may happen so that this
@@ -5043,13 +5047,19 @@ vy_apply_upsert(const struct tuple *new_stmt, const struct tuple *old_stmt,
 		assert(old_type == IPROTO_DELETE || old_type == IPROTO_REPLACE);
 		/*
 		 * UPDATE case: return the updated old stmt.
+		 * Last argument (key_compatible) is false,
+		 * because the original statement has UPSERT type
+		 * and contains full tuple with not only indexed
+		 * fields. So the result REPLACE is not compatible
+		 * with key.
 		 */
 		result_stmt = vy_stmt_new_replace(result_mp, result_mp_end,
-						  format, key_def->part_count);
+						  format, key_def->part_count,
+						  false);
 		region_truncate(region, region_svp);
 		if (result_stmt == NULL)
 			return NULL; /* OOM */
-		vy_stmt_lsn_set(result_stmt, vy_stmt_lsn(new_stmt));
+		vy_stmt_set_lsn(result_stmt, vy_stmt_lsn(new_stmt));
 		goto check_key;
 	}
 
@@ -5076,7 +5086,7 @@ vy_apply_upsert(const struct tuple *new_stmt, const struct tuple *old_stmt,
 	}
 	if (result_stmt != NULL) {
 		region_truncate(region, region_svp);
-		vy_stmt_lsn_set(result_stmt, vy_stmt_lsn(new_stmt));
+		vy_stmt_set_lsn(result_stmt, vy_stmt_lsn(new_stmt));
 		goto check_key;
 	}
 
@@ -5105,7 +5115,7 @@ vy_apply_upsert(const struct tuple *new_stmt, const struct tuple *old_stmt,
 		return NULL;
 	}
 	region_truncate(region, region_svp);
-	vy_stmt_lsn_set(result_stmt, vy_stmt_lsn(new_stmt));
+	vy_stmt_set_lsn(result_stmt, vy_stmt_lsn(new_stmt));
 
 check_key:
 	/*
@@ -5333,7 +5343,7 @@ vy_insert_secondary(struct vy_tx *tx, struct vy_index *index,
 			return -1;
 	}
 	struct tuple *tuple = vy_stmt_new_replace(key, key_end, index->format,
-						  def->part_count);
+						  def->part_count, true);
 	if (tuple == NULL)
 		return -1;
 	int rc = vy_tx_set(tx, index, tuple);
@@ -5367,7 +5377,7 @@ vy_replace_one(struct vy_tx *tx, struct space *space,
 	assert(def->iid == 0);
 	struct tuple *new_tuple =
 		vy_stmt_new_replace(request->tuple, request->tuple_end,
-				    pk->format, def->part_count);
+				    pk->format, def->part_count, false);
 	if (new_tuple == NULL)
 		return -1;
 	/**
@@ -5451,7 +5461,7 @@ vy_replace_impl(struct vy_tx *tx, struct space *space, struct request *request,
 	struct key_def *def = pk->key_def;
 	assert(def->iid == 0);
 	new_stmt = vy_stmt_new_replace(request->tuple, request->tuple_end,
-				       pk->format, def->part_count);
+				       pk->format, def->part_count, false);
 	if (new_stmt == NULL)
 		return -1;
 	const char *key = tuple_extract_key(new_stmt, def, NULL);
@@ -5820,7 +5830,7 @@ vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 		return -1;
 	stmt->new_tuple =
 		vy_stmt_new_replace(new_tuple, new_tuple_end, pk->format,
-				    pk->key_def->part_count);
+				    pk->key_def->part_count, false);
 	if (stmt->new_tuple == NULL)
 		return -1;
 	if (vy_check_update(pk, stmt->old_tuple, stmt->new_tuple))
@@ -5961,7 +5971,7 @@ vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	if (old_stmt == NULL) {
 		stmt->new_tuple =
 			vy_stmt_new_replace(tuple, tuple_end, pk->format,
-					    pk_def->part_count);
+					    pk_def->part_count, false);
 		if (stmt->new_tuple == NULL)
 			return -1;
 		return vy_insert_first_upsert(tx, space, stmt->new_tuple);
@@ -5989,7 +5999,7 @@ vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	stmt->old_tuple = old_stmt;
 	stmt->new_tuple =
 		vy_stmt_new_replace(new_tuple, new_tuple_end, pk->format,
-				    pk->key_def->part_count);
+				    pk->key_def->part_count, false);
 	if (stmt->new_tuple == NULL)
 		return -1;
 
@@ -6056,7 +6066,7 @@ vy_insert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	/* First insert into the primary index. */
 	stmt->new_tuple =
 		vy_stmt_new_replace(request->tuple, request->tuple_end,
-				    pk->format, def->part_count);
+				    pk->format, def->part_count, false);
 	if (stmt->new_tuple == NULL)
 		return -1;
 	if (vy_insert_primary(tx, pk, stmt->new_tuple) != 0)

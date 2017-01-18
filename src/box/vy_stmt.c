@@ -106,9 +106,9 @@ vy_stmt_alloc(struct tuple_format *format, uint32_t size)
 	tuple_format_ref(format, 1);
 	tuple->bsize = 0;
 	tuple->data_offset = 0;
-	vy_stmt_lsn_set(tuple, 0);
-	vy_stmt_type_set(tuple, 0);
-	vy_stmt_n_upserts_set(tuple, 0);
+	vy_stmt_set_lsn(tuple, 0);
+	vy_stmt_set_type(tuple, 0);
+	vy_stmt_set_n_upserts(tuple, 0);
 	return tuple;
 }
 
@@ -168,7 +168,8 @@ vy_stmt_new_key(struct tuple_format *format, const char *key,
 	char *data = mp_encode_array(raw, part_count);
 	memcpy(data, key, key_size);
 	assert(data + key_size == raw + size);
-	vy_stmt_type_set(stmt, type);
+	vy_stmt_set_type(stmt, type);
+	vy_stmt_set_key_compatible(stmt, true);
 	return stmt;
 }
 
@@ -238,7 +239,7 @@ vy_stmt_new_with_ops(const char *tuple_begin, const char *tuple_end,
 		wpos += op->iov_len;
 	}
 	stmt->bsize += extra_size;
-	vy_stmt_type_set(stmt, type);
+	vy_stmt_set_type(stmt, type);
 
 	/* Calculate offsets for key parts */
 	if (tuple_init_field_map(format, (uint32_t *) raw, raw)) {
@@ -259,10 +260,20 @@ vy_stmt_new_upsert(const char *tuple_begin, const char *tuple_end,
 
 struct tuple *
 vy_stmt_new_replace(const char *tuple_begin, const char *tuple_end,
-		    struct tuple_format *format, uint32_t part_count)
+		    struct tuple_format *format, uint32_t part_count,
+		    bool key_compatible)
 {
-	return vy_stmt_new_with_ops(tuple_begin, tuple_end, IPROTO_REPLACE,
-				    format, part_count, NULL, 0);
+	struct tuple *stmt = NULL;
+	if (! key_compatible) {
+		stmt = vy_stmt_new_with_ops(tuple_begin, tuple_end,
+					    IPROTO_REPLACE, format, part_count,
+					    NULL, 0);
+	} else {
+		stmt = vy_key_from_msgpack(format, tuple_begin);
+		if (stmt != NULL)
+			vy_stmt_set_type(stmt, IPROTO_REPLACE);
+	}
+	return stmt;
 }
 
 struct tuple *
@@ -283,8 +294,15 @@ vy_stmt_replace_from_upsert(const struct tuple *upsert)
 	memcpy((char *) replace + sizeof(struct vy_stmt),
 	       (char *) upsert + sizeof(struct vy_stmt), size);
 	replace->bsize = bsize;
-	vy_stmt_type_set(replace, IPROTO_REPLACE);
-	vy_stmt_lsn_set(replace, vy_stmt_lsn(upsert));
+	vy_stmt_set_type(replace, IPROTO_REPLACE);
+	vy_stmt_set_lsn(replace, vy_stmt_lsn(upsert));
+	/*
+	 * The original statement has UPSERT type so the statement
+	 * contains full tuple with not only indexes fields and
+	 * the result REPLACE contains too. So the REPLACE is not
+	 * compatible with key.
+	 */
+	vy_stmt_set_key_compatible(replace, false);
 	replace->data_offset = upsert->data_offset;
 	return replace;
 }
@@ -293,19 +311,14 @@ struct tuple *
 vy_stmt_extract_key(const struct tuple *stmt, const struct key_def *key_def,
 		    struct region *region)
 {
-	uint8_t type = vy_stmt_type(stmt);
 	struct tuple_format *format = tuple_format_by_id(stmt->format_id);
-	if (type == IPROTO_SELECT || type == IPROTO_DELETE) {
+	if (vy_stmt_key_compatible(stmt)) {
 		/*
 		 * The statement already is a key, so simply copy it in new
 		 * struct vy_stmt as SELECT.
 		 */
-		struct tuple *res = vy_stmt_dup(stmt);
-		if (res != NULL)
-			vy_stmt_type_set(res, IPROTO_SELECT);
-		return res;
+		return vy_key_from_msgpack(format, vy_stmt_cast_to_key(stmt));
 	}
-	assert(type == IPROTO_REPLACE || type == IPROTO_UPSERT);
 	uint32_t size;
 	size_t region_svp = region_used(region);
 	char *key = tuple_extract_key(stmt, key_def, &size);
@@ -316,7 +329,8 @@ vy_stmt_extract_key(const struct tuple *stmt, const struct key_def *key_def,
 		goto error;
 	memcpy((char *) ret + sizeof(struct vy_stmt), key, size);
 	region_truncate(region, region_svp);
-	vy_stmt_type_set(ret, IPROTO_SELECT);
+	vy_stmt_set_type(ret, IPROTO_SELECT);
+	vy_stmt_set_key_compatible(ret, true);
 	ret->data_offset = sizeof(struct vy_stmt);
 	ret->bsize = size;
 	return ret;
@@ -381,7 +395,8 @@ vy_stmt_decode(struct xrow_header *xrow, struct tuple_format *format,
 	case IPROTO_REPLACE:
 		stmt = vy_stmt_new_replace(request.tuple,
 					   request.tuple_end,
-					   format, part_count);
+					   format, part_count,
+					   request.index_id > 1);
 		break;
 	case IPROTO_UPSERT:
 		ops.iov_base = (char *)request.ops;
@@ -398,7 +413,7 @@ vy_stmt_decode(struct xrow_header *xrow, struct tuple_format *format,
 	if (stmt == NULL)
 		return NULL; /* OOM */
 
-	vy_stmt_lsn_set(stmt, xrow->lsn);
+	vy_stmt_set_lsn(stmt, xrow->lsn);
 	return stmt;
 }
 
