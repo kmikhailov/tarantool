@@ -377,18 +377,22 @@ vy_log_record_decode(struct vy_log_record *record,
 		return -1;
 
 	const char *pos = req.tuple;
-
 	if (mp_typeof(*pos) != MP_ARRAY ||
 	    mp_decode_array(&pos) != 2)
 		goto fail;
-
+	if (mp_typeof(*pos) != MP_UINT)
+		goto fail;
 	record->type = mp_decode_uint(&pos);
 	if (record->type >= vy_log_MAX)
 		goto fail;
+	if (mp_typeof(*pos) != MP_MAP)
+		goto fail;
+	uint32_t n_keys = mp_decode_map(&pos);
 
 	unsigned long key_mask = 0;
-	uint32_t n_keys = mp_decode_map(&pos);
 	for (uint32_t i = 0; i < n_keys; i++) {
+		if (mp_typeof(*pos) != MP_UINT)
+			goto fail;
 		uint32_t key = mp_decode_uint(&pos);
 		switch (key) {
 		case VY_LOG_KEY_INDEX_ID:
@@ -430,7 +434,7 @@ vy_log_record_decode(struct vy_log_record *record,
 fail:
 	buf = tt_static_buf();
 	mp_snprint(buf, TT_STATIC_BUF_LEN, req.tuple);
-	say_error("Invalid record in vinyl metadata log: %s", buf);
+	say_error("invalid record in vinyl metadata log: %s", buf);
 	diag_set(ClientError, ER_VINYL, "invalid vinyl log record");
 	return -1;
 }

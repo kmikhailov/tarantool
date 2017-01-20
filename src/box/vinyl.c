@@ -2068,13 +2068,6 @@ enum vy_request_page_key {
 	VY_PAGE_ROW_INDEX_OFFSET = 4
 };
 
-const char *vy_page_info_key_strs[] = {
-	"count",
-	"min",
-	"data size",
-	"row index"
-};
-
 const uint64_t vy_page_info_key_map = (1 << VY_PAGE_REQUEST_COUNT) |
 				      (1 << VY_PAGE_MIN_KEY) |
 				      (1 << VY_PAGE_DATA_SIZE) |
@@ -2163,59 +2156,74 @@ static int
 vy_page_info_decode(struct vy_page_info *page, const struct xrow_header *xrow,
 		    struct tuple_format *format)
 {
-	struct request request;
-	/* extract all pages info */
-	request_create(&request, xrow->type);
-	request_decode(&request, xrow->body->iov_base, xrow->body->iov_len);
-	const char *pos = request.tuple;
-	if (mp_decode_array(&pos) < 3) {
-		diag_set(ClientError, ER_VINYL, "Can't decode page meta "
-			 "tuple is too small");
-		return -1;
-	}
+	char *buf;
 
 	memset(page, 0, sizeof(*page));
+
+	struct request request;
+	request_create(&request, xrow->type);
+	if (request_decode(&request, xrow->body->iov_base,
+			   xrow->body->iov_len) < 0)
+		return -1;
+
+	const char *pos = request.tuple;
+	if (mp_typeof(*pos) != MP_ARRAY ||
+	    mp_decode_array(&pos) < 3)
+		goto decode_error;
+	if (mp_typeof(*pos) != MP_UINT)
+		goto decode_error;
 	page->offset = mp_decode_uint(&pos);
+	if (mp_typeof(*pos) != MP_UINT)
+		goto decode_error;
 	page->size = mp_decode_uint(&pos);
+	if (mp_typeof(*pos) != MP_MAP)
+		goto decode_error;
+	uint32_t map_size = mp_decode_map(&pos);
 
 	uint64_t key_map = vy_page_info_key_map;
-	uint32_t map_size = mp_decode_map(&pos);
-	uint32_t map_item;
-	const char *key_beg;
-	for (map_item = 0; map_item < map_size; ++map_item) {
+	for (uint32_t map_item = 0; map_item < map_size; map_item++) {
+		if (mp_typeof(*pos) != MP_UINT)
+			goto decode_error;
 		uint32_t key = mp_decode_uint(&pos);
 		key_map &= ~(1 << key);
 		switch (key) {
 		case VY_PAGE_REQUEST_COUNT:
+			if (mp_typeof(*pos) != MP_UINT)
+				goto decode_error;
 			page->count = mp_decode_uint(&pos);
 			break;
 		case VY_PAGE_MIN_KEY:
-			key_beg = pos;
+			if (mp_typeof(*pos) != MP_ARRAY)
+				goto decode_error;
+			page->min_key = vy_key_from_msgpack(format, pos);
+			if (page->min_key == NULL)
+				return -1; /* OOM */
 			mp_next(&pos);
-			uint32_t part_count;
-			part_count = mp_decode_array(&key_beg);
-			page->min_key = vy_stmt_new_select(format, key_beg,
-							   part_count);
 			break;
 		case VY_PAGE_DATA_SIZE:
+			if (mp_typeof(*pos) != MP_UINT)
+				goto decode_error;
 			page->unpacked_size = mp_decode_uint(&pos);
 			break;
 		case VY_PAGE_ROW_INDEX_OFFSET:
+			if (mp_typeof(*pos) != MP_UINT)
+				goto decode_error;
 			page->row_index_offset = mp_decode_uint(&pos);
 			break;
 		default:
-			diag_set(ClientError, ER_VINYL, "Can't decode page meta "
-				 "unknown page meta key %d", key);
-			return -1;
+			goto decode_error;
 		}
 	}
-	if (key_map) {
-		diag_set(ClientError, ER_MISSING_REQUEST_FIELD,
-			 vy_page_info_key_strs[__builtin_ffsll(key_map) - 1]);
-		return -1;
-	}
-
+	if (key_map != 0)
+		goto decode_error;
 	return 0;
+
+decode_error:
+	buf = tt_static_buf();
+	mp_snprint(buf, TT_STATIC_BUF_LEN, request.tuple);
+	say_error("invalid vinyl page info: %s", buf);
+	diag_set(ClientError, ER_VINYL, "invalid vinyl page info");
+	return -1;
 }
 
 /** vy_page_info }}} */
@@ -2229,14 +2237,6 @@ enum vy_request_run_key {
 	VY_RUN_MIN_LSN = 1,
 	VY_RUN_MAX_LSN = 2,
 	VY_RUN_PAGE_COUNT = 3,
-};
-
-const char *vy_run_info_key_strs[] = {
-	"min lsn",
-	"max lsn",
-	"page count",
-	"range min key",
-	"range max key"
 };
 
 const uint64_t vy_run_info_key_map = (1 << VY_RUN_MIN_LSN) |
@@ -2312,50 +2312,60 @@ static int
 vy_run_info_decode(struct vy_run_info *run_info,
 		   const struct xrow_header *xrow)
 {
+	char *buf;
+
+	memset(run_info, 0, sizeof(*run_info));
+
 	struct request request;
 	request_create(&request, xrow->type);
 	if (request_decode(&request, xrow->body->iov_base,
-			   xrow->body->iov_len)) {
+			   xrow->body->iov_len))
 		return -1;
-	}
 
-	/* decode run */
 	const char *pos = request.tuple;
-	if (mp_decode_array(&pos) < 1) {
-		diag_set(ClientError, ER_VINYL, "Can't decode run meta: "
-			 "not enough values");
-		return -1;
-	}
-	memset(run_info, 0, sizeof(*run_info));
-	uint64_t key_map = vy_run_info_key_map;
+	if (mp_typeof(*pos) != MP_ARRAY ||
+	    mp_decode_array(&pos) < 1)
+		goto decode_error;
+	if (mp_typeof(*pos) != MP_MAP)
+		goto decode_error;
 	uint32_t map_size = mp_decode_map(&pos);
-	uint32_t map_item;
-	/* decode run values */
-	for (map_item = 0; map_item < map_size; ++map_item) {
+
+	uint64_t key_map = vy_run_info_key_map;
+	for (uint32_t map_item = 0; map_item < map_size; map_item++) {
+		if (mp_typeof(*pos) != MP_UINT)
+			goto decode_error;
 		uint32_t key = mp_decode_uint(&pos);
 		key_map &= ~(1 << key);
 		switch (key) {
 		case VY_RUN_MIN_LSN:
+			if (mp_typeof(*pos) != MP_UINT)
+				goto decode_error;
 			run_info->min_lsn = mp_decode_uint(&pos);
 			break;
 		case VY_RUN_MAX_LSN:
+			if (mp_typeof(*pos) != MP_UINT)
+				goto decode_error;
 			run_info->max_lsn = mp_decode_uint(&pos);
 			break;
 		case VY_RUN_PAGE_COUNT:
+			if (mp_typeof(*pos) != MP_UINT)
+				goto decode_error;
 			run_info->count = mp_decode_uint(&pos);
 			break;
 		default:
-			diag_set(ClientError, ER_VINYL,
-				 "Unknown run meta key %d", key);
-			return -1;
+			goto decode_error;
 		}
 	}
-	if (key_map) {
-		diag_set(ClientError, ER_MISSING_REQUEST_FIELD,
-			 vy_run_info_key_strs[__builtin_ffsll(key_map) - 1]);
-		return -1;
-	}
+	if (key_map != 0)
+		goto decode_error;
 	return 0;
+
+decode_error:
+	buf = tt_static_buf();
+	mp_snprint(buf, TT_STATIC_BUF_LEN, request.tuple);
+	say_error("invalid vinyl run info: %s", buf);
+	diag_set(ClientError, ER_VINYL, "invalid vinyl run info");
+	return -1;
 }
 
 /* vy_run_info }}} */
@@ -6478,21 +6488,24 @@ vy_row_index_decode(uint32_t *row_index, uint32_t count,
 			   xrow->body->iov_len) == -1) {
 		return -1;
 	}
-	if (request.tuple == NULL) {
-error:
-		diag_set(ClientError, ER_VINYL, "Can't decode row index");
-		return -1;
-	}
+	if (request.tuple == NULL)
+		goto decode_error;
 	const char *pos = request.tuple;
-	if (mp_decode_array(&pos) != 1)
-		goto error;
+	if (mp_typeof(*pos) != MP_ARRAY ||
+	    mp_decode_array(&pos) != 1)
+		goto decode_error;
+	if (mp_typeof(*pos) != MP_BIN)
+		goto decode_error;
 	uint32_t size = mp_decode_binl(&pos);
 	if (size != sizeof(uint32_t) * count)
-		goto error;
+		goto decode_error;
 	for (uint32_t i = 0; i < count; ++i)
 		row_index[i] = mp_load_u32(&pos);
 	assert(pos == request.tuple_end);
 	return 0;
+decode_error:
+	diag_set(ClientError, ER_VINYL, "Can't decode row index");
+	return -1;
 }
 /**
  * Read a page requests from vinyl xlog data file.
