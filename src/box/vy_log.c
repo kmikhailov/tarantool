@@ -435,7 +435,8 @@ fail:
 	buf = tt_static_buf();
 	mp_snprint(buf, TT_STATIC_BUF_LEN, req.tuple);
 	say_error("invalid record in vinyl metadata log: %s", buf);
-	diag_set(ClientError, ER_VINYL, "invalid vinyl log record");
+	diag_set(ClientError, ER_DATA_CORRUPTION,
+		 "failed to decode vinyl metadata record");
 	return -1;
 }
 
@@ -618,7 +619,8 @@ static int
 vy_recovery_hash_index(struct vy_recovery *recovery, int64_t index_id)
 {
 	if (vy_recovery_lookup_index(recovery, index_id) != NULL) {
-		diag_set(ClientError, ER_VINYL, "duplicate index id");
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "duplicate index id in vinyl metadata");
 		return -1;
 	}
 	struct vy_index_recovery_info *index = malloc(sizeof(*index));
@@ -648,13 +650,15 @@ vy_recovery_hash_run(struct vy_recovery *recovery,
 		     int64_t range_id, int64_t run_id)
 {
 	if (vy_recovery_lookup_run(recovery, run_id) != NULL) {
-		diag_set(ClientError, ER_VINYL, "duplicate run id");
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "duplicate run id in vinyl metadata");
 		return -1;
 	}
 	struct vy_range_recovery_info *range;
 	range = vy_recovery_lookup_range(recovery, range_id);
 	if (range == NULL) {
-		diag_set(ClientError, ER_VINYL, "unknown range id");
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "range id not found in vinyl metadata");
 		return -1;
 	}
 	struct vy_run_recovery_info *run = malloc(sizeof(*run));
@@ -687,7 +691,8 @@ vy_recovery_unhash_run(struct vy_recovery *recovery, int64_t run_id)
 	struct mh_i64ptr_t *h = recovery->run_hash;
 	mh_int_t k = mh_i64ptr_find(h, run_id, NULL);
 	if (k == mh_end(h)) {
-		diag_set(ClientError, ER_VINYL, "unknown run id");
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "run id not found in vinyl metadata");
 		return -1;
 	}
 	struct vy_run_recovery_info *run = mh_i64ptr_node(h, k)->val;
@@ -707,13 +712,15 @@ vy_recovery_hash_range(struct vy_recovery *recovery,
 		       const char *begin, const char *end)
 {
 	if (vy_recovery_lookup_range(recovery, range_id) != NULL) {
-		diag_set(ClientError, ER_VINYL, "duplicate range id");
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "duplicate range id in vinyl metadata");
 		return -1;
 	}
 	struct vy_index_recovery_info *index;
 	index = vy_recovery_lookup_index(recovery, index_id);
 	if (index == NULL) {
-		diag_set(ClientError, ER_VINYL, "unknown index id");
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "index id not found in vinyl metadata");
 		return -1;
 	}
 
@@ -763,7 +770,8 @@ vy_recovery_unhash_range(struct vy_recovery *recovery, int64_t range_id)
 	struct mh_i64ptr_t *h = recovery->range_hash;
 	mh_int_t k = mh_i64ptr_find(h, range_id, NULL);
 	if (k == mh_end(h)) {
-		diag_set(ClientError, ER_VINYL, "unknown range id");
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "range id not found in vinyl metadata");
 		return -1;
 	}
 	struct vy_range_recovery_info *range = mh_i64ptr_node(h, k)->val;
@@ -923,7 +931,8 @@ vy_recovery_load_index(struct vy_recovery *recovery, int64_t index_id,
 
 	index = vy_recovery_lookup_index(recovery, index_id);
 	if (index == NULL) {
-		diag_set(ClientError, ER_VINYL, "unknown index id");
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "index id not found in vinyl metadata");
 		return -1;
 	}
 

@@ -391,7 +391,8 @@ vy_stmt_decode(struct xrow_header *xrow, struct tuple_format *format,
 					  format, part_count, &ops, 1);
 		break;
 	default:
-		diag_set(ClientError, ER_VINYL, "unknown request type");
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "unknown vinyl statement type");
 		return NULL;
 	}
 

@@ -112,7 +112,7 @@ struct errcode_record {
 	/* 57 */_(ER_NO_SUCH_ENGINE,		"Space engine '%s' does not exist") \
 	/* 58 */_(ER_RELOAD_CFG,		"Can't set option '%s' dynamically") \
 	/* 59 */_(ER_CFG,			"Incorrect value for option '%s': %s") \
-	/* 60 */_(ER_VINYL,			"%s") \
+	/* 60 */_(ER_DATA_CORRUPTION,		"Data corruption: %s") \
 	/* 61 */_(ER_LOCAL_SERVER_IS_NOT_ACTIVE,"Local server is not active") \
 	/* 62 */_(ER_UNKNOWN_SERVER,		"Server %s is not registered with the cluster") \
 	/* 63 */_(ER_CLUSTER_ID_MISMATCH,	"Cluster id of the replica %s doesn't match cluster id of the master %s") \

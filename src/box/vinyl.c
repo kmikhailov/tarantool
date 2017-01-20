@@ -2222,7 +2222,8 @@ decode_error:
 	buf = tt_static_buf();
 	mp_snprint(buf, TT_STATIC_BUF_LEN, request.tuple);
 	say_error("invalid vinyl page info: %s", buf);
-	diag_set(ClientError, ER_VINYL, "invalid vinyl page info");
+	diag_set(ClientError, ER_DATA_CORRUPTION,
+		 "failed to decode vinyl page info");
 	return -1;
 }
 
@@ -2364,7 +2365,8 @@ decode_error:
 	buf = tt_static_buf();
 	mp_snprint(buf, TT_STATIC_BUF_LEN, request.tuple);
 	say_error("invalid vinyl run info: %s", buf);
-	diag_set(ClientError, ER_VINYL, "invalid vinyl run info");
+	diag_set(ClientError, ER_DATA_CORRUPTION,
+		 "failed to decode vinyl run info");
 	return -1;
 }
 
@@ -2507,7 +2509,8 @@ vy_run_recover(struct vy_run *run, const char *dir, struct tuple_format *format)
 	while ((rc = xlog_cursor_next_row(&cursor, &xrow)) == 0) {
 		if (page_no >= run->info.count) {
 			/** To many pages in file */
-			diag_set(ClientError, ER_VINYL, "To many pages in run meta file");
+			diag_set(ClientError, ER_DATA_CORRUPTION,
+				 "too many pages in vinyl run index");
 			goto fail_close;
 		}
 		struct vy_page_info *page = run->info.page_infos + page_no;
@@ -2807,7 +2810,8 @@ vy_index_recovery_cb(const struct vy_log_record *record, void *cb_arg)
 		}
 		if (range->begin != NULL && range->end != NULL &&
 		    vy_key_compare(range->begin, range->end, key_def) >= 0) {
-			diag_set(ClientError, ER_VINYL, "invalid range");
+			diag_set(ClientError, ER_DATA_CORRUPTION,
+				 "invalid vinyl range boundaries");
 			return -1;
 		}
 		vy_index_add_range(index, range);
@@ -2857,7 +2861,8 @@ vy_index_open_ex(struct vy_index *index)
 		vy_scheduler_add_range(env->scheduler, range);
 	}
 	if (range != NULL || prev->end != NULL) {
-		diag_set(ClientError, ER_VINYL, "range overlap or hole");
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "vinyl range missing or overlap");
 		return -1;
 	}
 	return 0;
@@ -6504,7 +6509,8 @@ vy_row_index_decode(uint32_t *row_index, uint32_t count,
 	assert(pos == request.tuple_end);
 	return 0;
 decode_error:
-	diag_set(ClientError, ER_VINYL, "Can't decode row index");
+	diag_set(ClientError, ER_DATA_CORRUPTION,
+		 "failed to decode vinyl row index");
 	return -1;
 }
 /**
@@ -6532,8 +6538,9 @@ vy_page_read(struct vy_page *page, const struct vy_page_info *page_info, int fd,
 		goto error;
 	}
 	if (readen != (ssize_t)page_info->size) {
-		/* TODO: replace with XlogError, report filename */
-		diag_set(ClientError, ER_VINYL, "Unexpected end of file");
+		/* TODO: report filename */
+		diag_set(ClientError, ER_DATA_CORRUPTION,
+			 "unexpected end of vinyl run file");
 		goto error;
 	}
 	ERROR_INJECT(ERRINJ_VY_READ_PAGE_TIMEOUT, {usleep(50000);});
@@ -6555,7 +6562,7 @@ vy_page_read(struct vy_page *page, const struct vy_page_info *page_info, int fd,
 		goto error;
 	region_truncate(&fiber()->gc, region_svp);
 	ERROR_INJECT(ERRINJ_VY_READ_PAGE, {
-		diag_set(ClientError, ER_VINYL, "page read injection");
+		diag_set(ClientError, ER_INJECTION, "vinyl page read");
 		return -1;});
 	return 0;
 error:
