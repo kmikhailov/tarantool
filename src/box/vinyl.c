@@ -2462,6 +2462,8 @@ vy_run_recover(struct vy_run *run, const char *dir, struct tuple_format *format)
 {
 	char path[PATH_MAX];
 	vy_run_snprint_path(path, sizeof(path), dir, run->id, VY_FILE_INDEX);
+	say_info("load vinyl index from `%s'", path);
+
 	struct xlog_cursor cursor;
 	if (xlog_cursor_open(&cursor, path))
 		goto fail;
@@ -2512,6 +2514,8 @@ vy_run_recover(struct vy_run *run, const char *dir, struct tuple_format *format)
 
 	/* Prepare data file for reading. */
 	vy_run_snprint_path(path, sizeof(path), dir, run->id, VY_FILE_RUN);
+	say_info("load vinyl run from `%s'", path);
+
 	if (xlog_cursor_open(&cursor, path))
 		goto fail;
 	meta = &cursor.meta;

@@ -848,6 +848,8 @@ vy_recovery_new(const char *dir)
 		goto out;
 	}
 
+	say_info("load vinyl metadata from `%s'", path);
+
 	struct xlog_cursor cursor;
 	if (xlog_cursor_open(&cursor, path) < 0)
 		goto fail_free;
