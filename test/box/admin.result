@@ -61,7 +61,9 @@ cfg_filter(box.cfg)
   - - too_long_threshold
     - 0.5
   - - vinyl
-    - - - compact_wm
+    - - - cache
+        - 0.5
+      - - compact_wm
         - 2
       - - memory_limit
         - 1
@@ -69,8 +71,6 @@ cfg_filter(box.cfg)
         - 8192
       - - range_size
         - 1073741824
-      - - read_cache_quota
-        - 0.5
       - - threads
         - 1
   - - vinyl_dir

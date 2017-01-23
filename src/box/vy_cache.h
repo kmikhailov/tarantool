@@ -1,7 +1,7 @@
 #ifndef INCLUDES_TARANTOOL_BOX_VY_CACHE_H
 #define INCLUDES_TARANTOOL_BOX_VY_CACHE_H
 /*
- * Copyright 2010-2016, Tarantool AUTHORS, please see AUTHORS file.
+ * Copyright 2010-2017, Tarantool AUTHORS, please see AUTHORS file.
  *
  * Redistribution and use in source and binary forms, with or
  * without modification, are permitted provided that the following
@@ -54,7 +54,7 @@ struct vy_cache_entry {
 	struct tuple *stmt;
 	/* Link in LRU list */
 	struct rlist in_lru;
-	/* READ_CACHE_LEFT_LINKED and/or READ_CACHE_RIGHT_LINKED, see
+	/* VY_CACHE_LEFT_LINKED and/or VY_CACHE_RIGHT_LINKED, see
 	 * description of them for more information */
 	uint32_t flags;
 };
@@ -112,7 +112,7 @@ struct vy_cache_env {
 	/** Common quota for read cache */
 	struct vy_quota quota;
 	/** Common mempool for vy_cache_entry struct */
-	struct mempool read_cache_entry_mempool;
+	struct mempool cache_entry_mempool;
 };
 
 /**
@@ -122,8 +122,8 @@ struct vy_cache_env {
  * @mem_quota - memory limit for the cache.
  */
 void
-vy_cache_env_init(struct vy_cache_env *env, struct slab_cache *slab_cache,
-		  uint64_t mem_quota);
+vy_cache_env_create(struct vy_cache_env *env, struct slab_cache *slab_cache,
+		    uint64_t mem_quota);
 
 /**
  * Destroy and free resources of cache environment.

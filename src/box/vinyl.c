@@ -108,7 +108,7 @@ struct vy_conf {
 	/* memory */
 	uint64_t memory_limit;
 	/* read cache quota */
-	uint64_t read_cache_quota;
+	uint64_t cache;
 };
 
 struct vy_env {
@@ -4226,7 +4226,7 @@ vy_conf_new()
 	}
 	conf->memory_limit = cfg_getd("vinyl.memory_limit")
 			     * 1024 * 1024 * 1024;
-	conf->read_cache_quota = cfg_getd("vinyl.read_cache_quota")
+	conf->cache = cfg_getd("vinyl.quota")
 				 * 1024 * 1024 * 1024;
 
 	conf->path = strdup(cfg_gets("vinyl_dir"));
@@ -6124,7 +6124,8 @@ vy_env_new(void)
 	ev_timer_init(&e->quota_timer, vy_env_quota_timer_cb, 0, 1.);
 	e->quota_timer.data = e;
 	ev_timer_start(loop(), &e->quota_timer);
-	vy_cache_env_init(&e->cache_env, slab_cache, e->conf->read_cache_quota);
+	vy_cache_env_create(&e->cache_env, slab_cache,
+			    e->conf->cache);
 	return e;
 error_squash_queue:
 	vy_scheduler_delete(e->scheduler);
@@ -8710,12 +8711,13 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct tuple **result)
 	if ((*(itr->vlsn) == INT64_MAX) && *result != NULL &&
 	    vy_stmt_lsn(*result) != INT64_MAX) {
 		int direction = iterator_direction(itr->iterator_type);
-		if (prev_key && vy_stmt_lsn(prev_key) == INT64_MAX)
+		if (prev_key && vy_stmt_lsn(prev_key) == INT64_MAX) {
 			vy_cache_add(itr->index->cache, *result, prev_key,
 					  direction);
-		else
+		} else {
 			vy_cache_add(itr->index->cache, *result, NULL,
 					  direction);
+		}
 	}
 
 clear:

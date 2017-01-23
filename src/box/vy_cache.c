@@ -34,36 +34,36 @@
 enum {
 	/* Flag in cache entry that means that there are no values in DB
 	 * that less than the current and greater than the previous */
-	READ_CACHE_LEFT_LINKED = 1,
+	VY_CACHE_LEFT_LINKED = 1,
 	/* Flag in cache entry that means that there are no values in DB
 	 * that greater than the current and less than the previous */
-	READ_CACHE_RIGHT_LINKED = 2,
+	VY_CACHE_RIGHT_LINKED = 2,
 	/* Max number of deletes that are made by cleanup action per one
 	 * cache operation */
-	READ_CACHE_CLEANUP_MAX_STEPS = 10,
+	VY_CACHE_CLEANUP_MAX_STEPS = 10,
 };
 
 void
-vy_cache_env_init(struct vy_cache_env *e, struct slab_cache *slab_cache,
-		  uint64_t mem_quota)
+vy_cache_env_create(struct vy_cache_env *e, struct slab_cache *slab_cache,
+		    uint64_t mem_quota)
 {
 	rlist_create(&e->cache_lru);
 	vy_quota_init(&e->quota, mem_quota, NULL, NULL);
-	mempool_create(&e->read_cache_entry_mempool, slab_cache,
+	mempool_create(&e->cache_entry_mempool, slab_cache,
 		       sizeof(struct vy_cache_entry));
 }
 
 void
 vy_cache_env_destroy(struct vy_cache_env *e)
 {
-	mempool_destroy(&e->read_cache_entry_mempool);
+	mempool_destroy(&e->cache_entry_mempool);
 }
 
 static struct vy_cache_entry *
 vy_cache_entry_new(struct vy_cache_env *env, struct tuple *stmt)
 {
 	struct vy_cache_entry *entry = (struct vy_cache_entry *)
-		mempool_alloc(&env->read_cache_entry_mempool);
+		mempool_alloc(&env->cache_entry_mempool);
 	if (entry == NULL)
 		return NULL;
 	tuple_ref(stmt);
@@ -84,7 +84,7 @@ vy_cache_entry_delete(struct vy_cache_env *env, struct vy_cache_entry *entry)
 	tuple_unref(stmt);
 	rlist_del(&entry->in_lru);
 	TRASH(entry);
-	mempool_free(&env->read_cache_entry_mempool, entry);
+	mempool_free(&env->cache_entry_mempool, entry);
 }
 
 static void *
@@ -148,29 +148,29 @@ vy_cache_gc_step(struct vy_cache *cache)
 	struct vy_cache_tree *tree = &cache->cache_tree;
 	struct vy_cache_entry *entry =
 	rlist_last_entry(lru, struct vy_cache_entry, in_lru);
-	if (entry->flags & (READ_CACHE_LEFT_LINKED |
-			    READ_CACHE_RIGHT_LINKED)) {
+	if (entry->flags & (VY_CACHE_LEFT_LINKED |
+			    VY_CACHE_RIGHT_LINKED)) {
 		bool exact;
 		struct vy_cache_tree_iterator itr =
 			vy_cache_tree_lower_bound(tree, entry->stmt,
 						  &exact);
 		assert(exact);
-		if (entry->flags & READ_CACHE_LEFT_LINKED) {
+		if (entry->flags & VY_CACHE_LEFT_LINKED) {
 			struct vy_cache_tree_iterator prev = itr;
 			vy_cache_tree_iterator_prev(tree, &prev);
 			struct vy_cache_entry **prev_entry =
 				vy_cache_tree_iterator_get_elem(tree, &prev);
-			assert((*prev_entry)->flags & READ_CACHE_RIGHT_LINKED);
-			(*prev_entry)->flags &= ~READ_CACHE_RIGHT_LINKED;
+			assert((*prev_entry)->flags & VY_CACHE_RIGHT_LINKED);
+			(*prev_entry)->flags &= ~VY_CACHE_RIGHT_LINKED;
 		}
-		if (entry->flags & READ_CACHE_RIGHT_LINKED) {
+		if (entry->flags & VY_CACHE_RIGHT_LINKED) {
 			struct vy_cache_tree_iterator next = itr;
 			vy_cache_tree_iterator_next(&cache->cache_tree,
 						    &next);
 			struct vy_cache_entry **next_entry =
 				vy_cache_tree_iterator_get_elem(tree, &next);
-			assert((*next_entry)->flags & READ_CACHE_LEFT_LINKED);
-			(*next_entry)->flags &= ~READ_CACHE_LEFT_LINKED;
+			assert((*next_entry)->flags & VY_CACHE_LEFT_LINKED);
+			(*next_entry)->flags &= ~VY_CACHE_LEFT_LINKED;
 		}
 	}
 	cache->version++;
@@ -184,8 +184,7 @@ vy_cache_gc(struct vy_cache *cache)
 	struct vy_cache_env *env = cache->env;
 	struct vy_quota *q = &env->quota;
 	for (uint32_t i = 0;
-	     vy_quota_is_exceeded(q) &&
-	     i < READ_CACHE_CLEANUP_MAX_STEPS;
+	     vy_quota_is_exceeded(q) && i < VY_CACHE_CLEANUP_MAX_STEPS;
 	     i++) {
 		vy_cache_gc_step(cache);
 	}
@@ -225,8 +224,8 @@ vy_cache_add(struct vy_cache *cache, struct tuple *stmt,
 		return;
 
 	/* The flag that must be set in the inserted chain entry */
-	uint32_t flag = direction > 0 ? READ_CACHE_LEFT_LINKED :
-			READ_CACHE_RIGHT_LINKED;
+	uint32_t flag = direction > 0 ? VY_CACHE_LEFT_LINKED :
+			VY_CACHE_RIGHT_LINKED;
 	if (entry->flags & flag)
 		return;
 
@@ -251,8 +250,8 @@ vy_cache_add(struct vy_cache *cache, struct tuple *stmt,
 	/* Set proper flags */
 	entry->flags |= flag;
 	/* Set inverted flag in the previous entry */
-	prev_entry->flags |= (READ_CACHE_LEFT_LINKED |
-			      READ_CACHE_RIGHT_LINKED) ^ flag;
+	prev_entry->flags |= (VY_CACHE_LEFT_LINKED |
+			      VY_CACHE_RIGHT_LINKED) ^ flag;
 }
 
 void
@@ -266,27 +265,27 @@ vy_cache_on_write(struct vy_cache *cache, struct tuple *stmt)
 		return;
 	struct vy_cache_entry *entry =
 		*vy_cache_tree_iterator_get_elem(&cache->cache_tree, &itr);
-	if (entry->flags & READ_CACHE_LEFT_LINKED) {
+	if (entry->flags & VY_CACHE_LEFT_LINKED) {
 		cache->version++;
-		entry->flags &= ~READ_CACHE_LEFT_LINKED;
+		entry->flags &= ~VY_CACHE_LEFT_LINKED;
 		struct vy_cache_tree_iterator prev = itr;
 		vy_cache_tree_iterator_prev(&cache->cache_tree, &prev);
 		struct vy_cache_entry **prev_entry =
 			vy_cache_tree_iterator_get_elem(&cache->cache_tree,
 							&prev);
-		assert((*prev_entry)->flags & READ_CACHE_RIGHT_LINKED);
-		(*prev_entry)->flags &= ~READ_CACHE_RIGHT_LINKED;
+		assert((*prev_entry)->flags & VY_CACHE_RIGHT_LINKED);
+		(*prev_entry)->flags &= ~VY_CACHE_RIGHT_LINKED;
 	}
-	if (exact && (entry->flags & READ_CACHE_RIGHT_LINKED)) {
+	if (exact && (entry->flags & VY_CACHE_RIGHT_LINKED)) {
 		cache->version++;
-		entry->flags &= ~READ_CACHE_RIGHT_LINKED;
+		entry->flags &= ~VY_CACHE_RIGHT_LINKED;
 		struct vy_cache_tree_iterator next = itr;
 		vy_cache_tree_iterator_next(&cache->cache_tree, &next);
 		struct vy_cache_entry **next_entry =
 			vy_cache_tree_iterator_get_elem(&cache->cache_tree,
 							&next);
-		assert((*next_entry)->flags & READ_CACHE_LEFT_LINKED);
-		(*next_entry)->flags &= ~READ_CACHE_LEFT_LINKED;
+		assert((*next_entry)->flags & VY_CACHE_LEFT_LINKED);
+		(*next_entry)->flags &= ~VY_CACHE_LEFT_LINKED;
 	}
 	if (exact) {
 		cache->version++;
@@ -350,9 +349,9 @@ vy_cache_iterator_start(struct vy_cache_iterator *itr, struct tuple **ret,
 		vy_cache_tree_iterator_get_elem(tree, &itr->curr_pos);
 	struct tuple *candidate = (*entry)->stmt;
 	int dir = iterator_direction(itr->iterator_type);
-	if (dir > 0 && ((*entry)->flags & READ_CACHE_LEFT_LINKED))
+	if (dir > 0 && ((*entry)->flags & VY_CACHE_LEFT_LINKED))
 		*stop = true;
-	else if (dir < 0 && ((*entry)->flags & READ_CACHE_RIGHT_LINKED))
+	else if (dir < 0 && ((*entry)->flags & VY_CACHE_RIGHT_LINKED))
 		*stop = true;
 
 	while (vy_stmt_lsn(candidate) > *itr->vlsn) {
@@ -368,9 +367,9 @@ vy_cache_iterator_start(struct vy_cache_iterator *itr, struct tuple **ret,
 		if (itr->iterator_type == ITER_EQ &&
 		    vy_stmt_compare(key, candidate, itr->cache->key_def))
 			return 0;
-		if (dir > 0 && !((*entry)->flags & READ_CACHE_LEFT_LINKED))
+		if (dir > 0 && !((*entry)->flags & VY_CACHE_LEFT_LINKED))
 			*stop = false;
-		else if (dir < 0 && !((*entry)->flags & READ_CACHE_RIGHT_LINKED))
+		else if (dir < 0 && !((*entry)->flags & VY_CACHE_RIGHT_LINKED))
 			*stop = false;
 	}
 	itr->curr_stmt = candidate;
@@ -453,9 +452,9 @@ vy_cache_iterator_next_key(struct vy_stmt_iterator *vitr,
 	struct vy_cache_entry **entry =
 		vy_cache_tree_iterator_get_elem(tree, &itr->curr_pos);
 	int dir = iterator_direction(itr->iterator_type);
-	if (dir > 0 && ((*entry)->flags & READ_CACHE_LEFT_LINKED))
+	if (dir > 0 && ((*entry)->flags & VY_CACHE_LEFT_LINKED))
 		*stop = true;
-	else if (dir < 0 && ((*entry)->flags & READ_CACHE_RIGHT_LINKED))
+	else if (dir < 0 && ((*entry)->flags & VY_CACHE_RIGHT_LINKED))
 		*stop = true;
 
 	while (vy_stmt_lsn(itr->curr_stmt) > *itr->vlsn) {
@@ -473,9 +472,9 @@ vy_cache_iterator_next_key(struct vy_stmt_iterator *vitr,
 		if (itr->iterator_type == ITER_EQ &&
 		    vy_stmt_compare(key, stmt, itr->cache->key_def))
 			return 0;
-		if (dir > 0 && !((*entry)->flags & READ_CACHE_LEFT_LINKED))
+		if (dir > 0 && !((*entry)->flags & VY_CACHE_LEFT_LINKED))
 			*stop = false;
-		else if (dir < 0 && !((*entry)->flags & READ_CACHE_RIGHT_LINKED))
+		else if (dir < 0 && !((*entry)->flags & VY_CACHE_RIGHT_LINKED))
 			*stop = false;
 		itr->curr_stmt = stmt;
 		tuple_ref(itr->curr_stmt);
