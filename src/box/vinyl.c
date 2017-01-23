@@ -76,6 +76,7 @@
 #include "vy_log.h"
 #include "vy_stmt_iterator.h"
 #include "vy_mem.h"
+#include "vy_cache.h"
 
 #define HEAP_FORWARD_DECLARATION
 #include "salad/heap.h"
@@ -106,6 +107,8 @@ struct vy_conf {
 	char *path;
 	/* memory */
 	uint64_t memory_limit;
+	/* read cache quota */
+	uint64_t read_cache_quota;
 };
 
 struct vy_env {
@@ -139,6 +142,8 @@ struct vy_env {
 	struct vy_quota     quota;
 	/** Timer for updating quota watermark. */
 	ev_timer            quota_timer;
+	/** Enviroment for cache subsystem */
+	struct vy_cache_env cache_env;
 };
 
 #define vy_crcs(p, size, crc) \
@@ -521,6 +526,10 @@ typedef rb_tree(struct txv) read_set_t;
  */
 struct vy_index {
 	struct vy_env *env;
+	/* An merge cache for current index. Contains the hotest tuples
+	 * with continuation markers.
+	 */
+	struct vy_cache *cache;
 	/**
 	 * Conflict manager index. Contains all changes
 	 * made by transaction before they commit. Is used
@@ -3046,6 +3055,13 @@ vy_tx_write(struct txv *v, enum vinyl_status status, int64_t lsn)
 		rc = vy_range_set(range, stmt, vy_stmt_lsn(stmt));
 		break;
 	}
+
+	/*
+	 * Invalidate cache element.
+	 */
+	struct vy_cache *cache = index->cache;
+	vy_cache_on_write(cache, stmt);
+
 	return rc;
 }
 
@@ -4208,7 +4224,10 @@ vy_conf_new()
 		diag_set(OutOfMemory, sizeof(*conf), "conf", "struct");
 		return NULL;
 	}
-	conf->memory_limit = cfg_getd("vinyl.memory_limit")*1024*1024*1024;
+	conf->memory_limit = cfg_getd("vinyl.memory_limit")
+			     * 1024 * 1024 * 1024;
+	conf->read_cache_quota = cfg_getd("vinyl.read_cache_quota")
+				 * 1024 * 1024 * 1024;
 
 	conf->path = strdup(cfg_gets("vinyl_dir"));
 	if (conf->path == NULL) {
@@ -4635,6 +4654,10 @@ vy_index_new(struct vy_env *e, struct key_def *user_key_def,
 		}
 	}
 
+	index->cache = vy_cache_new(&e->cache_env, index->key_def);
+	if (index->cache == NULL)
+		goto fail_cache_init;
+
 	vy_range_tree_new(&index->tree);
 	index->version = 1;
 	rlist_create(&index->link);
@@ -4646,6 +4669,8 @@ vy_index_new(struct vy_env *e, struct key_def *user_key_def,
 
 	return index;
 
+fail_cache_init:
+	histogram_delete(index->run_hist);
 fail_run_hist:
 	free(index->name);
 	free(index->path);
@@ -4691,6 +4716,7 @@ vy_index_delete(struct vy_index *index)
 		key_def_delete(index->key_def_secondary_to_primary);
 	}
 	histogram_delete(index->run_hist);
+	vy_cache_delete(index->cache);
 	TRASH(index);
 	free(index);
 }
@@ -4935,6 +4961,10 @@ static int
 vy_tx_set(struct vy_tx *tx, struct vy_index *index, struct tuple *stmt)
 {
 	assert(vy_stmt_type(stmt) != 0);
+	/**
+	 * A statement in write set must have and unique lsn
+	 * in order to differ it from cachable statements in mem and run.
+	 */
 	vy_stmt_lsn_set(stmt, INT64_MAX);
 
 	/* Update concurrent index */
@@ -6094,6 +6124,7 @@ vy_env_new(void)
 	ev_timer_init(&e->quota_timer, vy_env_quota_timer_cb, 0, 1.);
 	e->quota_timer.data = e;
 	ev_timer_start(loop(), &e->quota_timer);
+	vy_cache_env_init(&e->cache_env, slab_cache, e->conf->read_cache_quota);
 	return e;
 error_squash_queue:
 	vy_scheduler_delete(e->scheduler);
@@ -6111,6 +6142,7 @@ error_conf:
 void
 vy_env_delete(struct vy_env *e)
 {
+	vy_cache_env_destroy(&e->cache_env);
 	struct vy_index *index, *tmp;
 	rlist_foreach_entry_safe(index, &e->indexes, link, tmp)
 		vy_index_unref(index);
@@ -7675,6 +7707,7 @@ struct vy_merge_src {
 		struct vy_run_iterator run_iterator;
 		struct vy_mem_iterator mem_iterator;
 		struct vy_txw_iterator txw_iterator;
+		struct vy_cache_iterator cache_iterator;
 		struct vy_stmt_iterator iterator;
 	};
 	/** Source can change during merge iteration */
@@ -8383,6 +8416,19 @@ vy_read_iterator_add_tx(struct vy_read_iterator *itr)
 }
 
 static void
+vy_read_iterator_add_cache(struct vy_read_iterator *itr)
+{
+	struct vy_merge_src *sub_src =
+		vy_merge_iterator_add(&itr->merge_iterator, true, false);
+	vy_cache_iterator_open(&sub_src->cache_iterator, itr->index->cache,
+			       itr->iterator_type, itr->key, itr->vlsn);
+	int rc = sub_src->iterator.iface->restore(&sub_src->iterator,
+						  itr->curr_stmt,
+						  &sub_src->stmt);
+	(void)rc;
+}
+
+static void
 vy_read_iterator_add_mem(struct vy_read_iterator *itr)
 {
 	struct vy_range *range = itr->curr_range;
@@ -8442,6 +8488,9 @@ vy_read_iterator_use_range(struct vy_read_iterator *itr)
 {
 	if (!itr->only_disk && itr->tx != NULL)
 		vy_read_iterator_add_tx(itr);
+
+	if (!itr->only_disk)
+		vy_read_iterator_add_cache(itr);
 
 	if (itr->curr_range == NULL)
 		return;
@@ -8589,33 +8638,48 @@ vy_read_iterator_next_range(struct vy_read_iterator *itr, struct tuple **ret)
 static NODISCARD int
 vy_read_iterator_next(struct vy_read_iterator *itr, struct tuple **result)
 {
+	*result = NULL;
+
 	if (!itr->search_started)
 		vy_read_iterator_start(itr);
-	*result = NULL;
+
+	struct tuple *prev_key = itr->curr_stmt;
+	if (prev_key != NULL)
+		tuple_ref(prev_key);
+
 	struct tuple *t = NULL;
 	struct vy_merge_iterator *mi = &itr->merge_iterator;
 	struct key_def *def = itr->index->key_def;
 	struct tuple_format *format = itr->index->format;
+	int rc = 0;
 	while (true) {
-		if (vy_read_iterator_merge_next_key(itr, &t))
-			return -1;
-restart:
+		if (vy_read_iterator_merge_next_key(itr, &t)) {
+			rc = -1;
+			goto clear;
+		}
+		restart:
 		if (mi->range_ended && itr->curr_range != NULL &&
-		    vy_read_iterator_next_range(itr, &t))
-			return -1;
-		if (t == NULL)
-			return 0; /* No more data. */
-		int rc = vy_merge_iterator_squash_upsert(mi, &t, true);
+		    vy_read_iterator_next_range(itr, &t)) {
+			rc = -1;
+			goto clear;
+		}
+		if (t == NULL) {
+			rc = 0; /* No more data. */
+			goto clear;
+		}
+		rc = vy_merge_iterator_squash_upsert(mi, &t, true);
 		if (rc != 0) {
 			if (rc == -1)
-				return -1;
+				goto clear;
 			do {
-				if (vy_read_iterator_restore(itr) < 0)
-					return -1;
+				if (vy_read_iterator_restore(itr) < 0) {
+					rc = -1;
+					goto clear;
+				}
 				rc = vy_merge_iterator_next_lsn(mi, &t);
 			} while (rc == -2);
 			if (rc != 0)
-				return -1;
+				goto clear;
 			goto restart;
 		}
 		assert(t != NULL);
@@ -8636,9 +8700,29 @@ restart:
 			tuple_unref(t);
 		}
 	}
+
 	*result = itr->curr_stmt;
 	assert(*result == NULL || vy_stmt_type(*result) == IPROTO_REPLACE);
-	return 0;
+
+	/**
+	 * Add a statement to the cache
+	 */
+	if ((*(itr->vlsn) == INT64_MAX) && *result != NULL &&
+	    vy_stmt_lsn(*result) != INT64_MAX) {
+		int direction = iterator_direction(itr->iterator_type);
+		if (prev_key && vy_stmt_lsn(prev_key) == INT64_MAX)
+			vy_cache_add(itr->index->cache, *result, prev_key,
+					  direction);
+		else
+			vy_cache_add(itr->index->cache, *result, NULL,
+					  direction);
+	}
+
+clear:
+	if (prev_key != NULL)
+		tuple_unref(prev_key);
+
+	return rc;
 }
 
 /**

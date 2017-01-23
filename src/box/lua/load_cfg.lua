@@ -10,7 +10,8 @@ local default_vinyl_cfg = {
     threads           = 1,
     compact_wm        = 2, -- try to maintain less than 2 runs in a range
     range_size        = 1024 * 1024 * 1024,
-    page_size        = 8 * 1024,
+    page_size         = 8 * 1024,
+    read_cache_quota  = 0.5, -- 512MB
 }
 
 -- all available options
@@ -61,7 +62,8 @@ local vinyl_template_cfg = {
     run_age_period    = 'number',
     run_age_wm        = 'number',
     range_size        = 'number',
-    page_size        = 'number',
+    page_size         = 'number',
+    read_cache_quota  = 'number',
 }
 
 -- types of available options

@@ -65,6 +65,8 @@ cfg_filter(box.cfg)
         - 8192
       - - range_size
         - 1073741824
+      - - read_cache_quota
+        - 0.5
       - - threads
         - 1
   - - vinyl_dir
@@ -135,6 +137,8 @@ cfg_filter(box.cfg)
         - 8192
       - - range_size
         - 1073741824
+      - - read_cache_quota
+        - 0.5
       - - threads
         - 1
   - - vinyl_dir
