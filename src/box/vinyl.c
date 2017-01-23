@@ -1541,6 +1541,13 @@ vy_range_remove_run(struct vy_range *range, struct vy_run *run)
 	range->size -= vy_run_size(run);
 }
 
+/** Return true if the range is being processed by a worker. */
+static bool
+vy_range_is_scheduled(struct vy_range *range)
+{
+	return range->in_dump.pos == UINT32_MAX;
+}
+
 static void
 vy_scheduler_add_range(struct vy_scheduler *, struct vy_range *range);
 static void
@@ -2837,6 +2844,127 @@ vy_range_update_compact_priority(struct vy_range *range)
 }
 
 /**
+ * Check if a range should be coalesced with one or more its neighbors.
+ * If it should, return true and set @p_first and @p_last to the first
+ * and last ranges to coalesce, otherwise return false.
+ *
+ * We coalesce ranges together when they become too small, less than
+ * half the target range size to avoid split-coalesce oscillations.
+ */
+static bool
+vy_range_needs_coalesce(struct vy_range *range,
+			struct vy_range **p_first, struct vy_range **p_last)
+{
+	struct vy_index *index = range->index;
+	uint64_t max_size = index->key_def->opts.range_size / 2;
+	uint64_t size = range->size;
+	struct vy_range *it;
+
+	assert(!vy_range_is_scheduled(range));
+
+	*p_first = *p_last = range;
+	for (it = vy_range_tree_next(&index->tree, range);
+	     it != NULL && !vy_range_is_scheduled(it);
+	     it = vy_range_tree_next(&index->tree, it)) {
+		if (size + it->size > max_size)
+			break;
+		size += it->size;
+		*p_last = it;
+	}
+	for (it = vy_range_tree_prev(&index->tree, range);
+	     it != NULL && !vy_range_is_scheduled(it);
+	     it = vy_range_tree_prev(&index->tree, it)) {
+		if (size + it->size > max_size)
+			break;
+		size += it->size;
+		*p_first = it;
+	}
+	return *p_first != *p_last;
+}
+
+/**
+ * Coalesce a range with one or more its neighbors
+ * if it is too small.
+ */
+static void
+vy_range_maybe_coalesce(struct vy_range *range)
+{
+	struct vy_index *index = range->index;
+	struct vy_scheduler *scheduler = index->env->scheduler;
+	struct vy_log *log = index->env->log;
+	struct error *e;
+
+	struct vy_range *first, *last;
+	if (!vy_range_needs_coalesce(range, &first, &last))
+		return;
+
+	struct vy_range *result = vy_range_new(index, -1,
+					       first->begin, last->end);
+	if (result == NULL)
+		goto fail;
+
+	struct vy_range *it;
+	struct vy_range *end = vy_range_tree_next(&index->tree, last);
+
+	/*
+	 * Log change in metadata.
+	 */
+	vy_log_tx_begin(log);
+	if (vy_log_insert_range(log, index->key_def->opts.lsn, result->id,
+			result->begin != NULL ? tuple_data(result->begin) : NULL,
+			result->end != NULL ? tuple_data(result->end) : NULL) < 0)
+		goto fail_rollback;
+	for (it = first; it != end; it = vy_range_tree_next(&index->tree, it)) {
+		if (vy_log_delete_range(log, it->id) < 0)
+			goto fail_rollback;
+		struct vy_run *run;
+		rlist_foreach_entry(run, &it->runs, in_range) {
+			if (vy_log_insert_run(log, result->id, run->id) < 0)
+				goto fail_rollback;
+		}
+	}
+	if (vy_log_tx_commit(log) < 0)
+		goto fail;
+
+	/*
+	 * Replace coalesced ranges with the resulting range.
+	 */
+	it = first;
+	while (it != end) {
+		struct vy_range *next = vy_range_tree_next(&index->tree, it);
+		vy_scheduler_remove_range(scheduler, it);
+		vy_index_unacct_range(index, it);
+		vy_index_remove_range(index, it);
+		vy_range_freeze_mem(it);
+		rlist_splice(&result->runs, &it->runs);
+		rlist_splice(&result->frozen, &it->frozen);
+		result->run_count += it->run_count;
+		result->size += it->size;
+		result->used += it->used;
+		if (result->min_lsn > it->min_lsn)
+			result->min_lsn = it->min_lsn;
+		vy_range_delete(it);
+		it = next;
+	}
+	/* Force compaction of the resulting range. */
+	range->compact_priority = range->run_count;
+	vy_index_add_range(index, result);
+	vy_index_acct_range(index, result);
+	vy_scheduler_add_range(scheduler, result);
+
+	say_info("%s: coalesced ranges %s", index->name, vy_range_str(result));
+	return;
+
+fail_rollback:
+	vy_log_tx_rollback(log);
+fail:
+	assert(!diag_is_empty(diag_get()));
+	e = diag_last_error(diag_get());
+	say_error("%s: failed to coalesce range %s: %s",
+		  index->name, vy_range_str(range), e->errmsg);
+}
+
+/**
  * Create an index directory for a new index.
  * TODO: create index files only after the WAL
  * record is committed.
@@ -3831,6 +3959,8 @@ vy_task_compact_complete(struct vy_task *task)
 		vy_run_unlink_files(index->path, run->id);
 		vy_run_unref(run);
 	}
+
+	vy_range_maybe_coalesce(range);
 	return 0;
 }
 
